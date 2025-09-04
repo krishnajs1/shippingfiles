@@ -1,12 +1,39 @@
+
 const mongoose = require('mongoose');
 const { ObjectId } = require('mongodb');
 
-/* ----------------------------- helpers ----------------------------------- */
 
-function toInt(v) {
-  if (typeof v === 'string') return parseInt(v, 10);
-  return v;
-}
+const DEFAULTS = {
+  maxTimeMS: parseInt(process.env.MONGO_OP_MAX_MS || '25000', 10),
+};
+
+const HINTS = {
+  sgprojects: { PMWEB_ProjectId: 1 },
+  projectphaseassetdetails: { PMWEB_ProjectId: 1 },
+  projectstagegates: { ProjectId: 1, ProjectStagegateIsActive: 1 },
+  projectprocess: { ProjectStagegateId: 1 },
+  projecttask: { ProjectProcessId: 1 },
+  projectactivity: { ProjectTaskId: 1 },
+  projectsubactivity: { ProjectActivityId: 1 },
+
+  projectprocesschecklist: { ProcessId: 1 },
+  projecttaskchecklist: { TaskId: 1 },
+  projectactivitychecklist: { ActivityId: 1 },
+  projectsubactivitychecklist: { SubActivityId: 1 },
+
+  projectprocessfiles: { ChecklistId: 1 },
+  projecttaskfiles: { ChecklistId: 1 },
+  projectactivityfiles: { ChecklistId: 1 },
+  projectsubactivityfiles: { ChecklistId: 1 },
+
+  filecontent_byId: { _id: 1 },
+  filecontent_byName: { FileName: 1 },
+};
+
+const ALLOWED_FILE_EXTS = new Set(['.docx', '.pdf', '.xlsx']);
+
+
+function toInt(v) { return typeof v === 'string' ? parseInt(v, 10) : v; }
 function buildUserMatch(pmwbUserId, pmwebProjectId) {
   const match = { PMWBUserId: toInt(pmwbUserId) };
   if (pmwebProjectId != null) match.PMWEBProjectId = toInt(pmwebProjectId);
@@ -17,104 +44,125 @@ function toObjectIds(ids) {
     .filter(Boolean)
     .map(id => (mongoose.Types.ObjectId.isValid(id) ? new mongoose.Types.ObjectId(id) : id));
 }
+function getDb(opts) { return (opts && opts.db) ? opts.db : mongoose.connection.db; }
+function aggOpts(opts, comment) {
+  return { allowDiskUse: true, maxTimeMS: (opts && opts.maxTimeMS) || DEFAULTS.maxTimeMS, comment };
+}
+function findOpts(opts) { return { maxTimeMS: (opts && opts.maxTimeMS) || DEFAULTS.maxTimeMS }; }
+function hasAllowedExt(name) {
+  const s = String(name || '').toLowerCase();
+  for (const ext of ALLOWED_FILE_EXTS) if (s.endsWith(ext)) return true;
+  return false;
+}
 
-/* ------------------------------ core queries ----------------------------- */
 
-/**
- * Flattened rows for a user's visibility:
- * projectusers → sgprojects → projectstagegates (active) → process → task → activity → subactivity
- * + projectphaseassetdetails (Community/Phase)
- *
- * NOTE: Stagegates/processes are unwound with preserveNull so phases show up even if empty.
- */
 async function getStagegateHierarchyRows(pmwbUserId, opts = {}) {
-  const db = mongoose.connection.db;
+  const db = getDb(opts);
   const users = db.collection('projectusers');
 
   const pipeline = [
     { $match: buildUserMatch(pmwbUserId, opts.pmwebProjectId) },
 
-    // Link projects (sgprojects)
+    // sgprojects (sub-pipeline + projection)
     {
       $lookup: {
         from: 'sgprojects',
-        localField: 'PMWEBProjectId',
-        foreignField: 'PMWEB_ProjectId',
-        as: 'project'
+        let: { projId: '$PMWEBProjectId' },
+        pipeline: [
+          { $match: { $expr: { $eq: ['$PMWEB_ProjectId', '$$projId'] } } },
+          { $project: { PMWEB_ProjectId: 1, PMWEB_ProjectName: 1, ProjectCommunity: 1, ProjectPhaseOrProject: 1 } },
+        ],
+        as: 'project',
       }
     },
-    { $unwind: '$project' }, // keep strict here: we scope using sgprojects
+    { $unwind: '$project' },
 
-    // Community / Phase labels
+    // projectphaseassetdetails
     {
       $lookup: {
         from: 'projectphaseassetdetails',
-        localField: 'PMWEBProjectId',
-        foreignField: 'PMWEB_ProjectId',
+        let: { projId: '$PMWEBProjectId' },
+        pipeline: [
+          { $match: { $expr: { $eq: ['$PMWEB_ProjectId', '$$projId'] } } },
+          { $project: { PMWEB_ProjectId: 1, Community: 1, Project: 1 } },
+        ],
         as: 'phaseDetails'
       }
     },
     { $unwind: { path: '$phaseDetails', preserveNullAndEmptyArrays: true } },
 
-    // Active stagegates for this sgproject (preserve even if none)
+    // projectstagegates (active)
     {
       $lookup: {
         from: 'projectstagegates',
-        let: { projId: '$project._id' },
+        let: { projObjId: '$project._id' },
         pipeline: [
-          { $match: { $expr: { $eq: ['$ProjectId', '$$projId'] } } },
-          { $match: { ProjectStagegateIsActive: true } }
+          { $match: { $expr: { $eq: ['$ProjectId', '$$projObjId'] } } },
+          { $match: { ProjectStagegateIsActive: true } },
+          { $project: { ProjectId: 1, ProjectStagegateName: 1 } },
         ],
         as: 'stagegates'
       }
     },
     { $unwind: { path: '$stagegates', preserveNullAndEmptyArrays: true } },
 
-    // SG → Process (preserve even if none)
+    // process
     {
       $lookup: {
         from: 'projectprocess',
-        localField: 'stagegates._id',
-        foreignField: 'ProjectStagegateId',
+        let: { sgId: '$stagegates._id' },
+        pipeline: [
+          { $match: { $expr: { $eq: ['$ProjectStagegateId', '$$sgId'] } } },
+          { $project: { ProjectStagegateId: 1, ProjectProcessName: 1 } },
+        ],
         as: 'processes'
       }
     },
     { $unwind: { path: '$processes', preserveNullAndEmptyArrays: true } },
 
-    // Process → Task (optional)
+    // task
     {
       $lookup: {
         from: 'projecttask',
-        localField: 'processes._id',
-        foreignField: 'ProjectProcessId',
+        let: { procId: '$processes._id' },
+        pipeline: [
+          { $match: { $expr: { $eq: ['$ProjectProcessId', '$$procId'] } } },
+          { $project: { ProjectProcessId: 1, ProjectTaskName: 1 } },
+        ],
         as: 'tasks'
       }
     },
     { $unwind: { path: '$tasks', preserveNullAndEmptyArrays: true } },
 
-    // Task → Activity (optional)
+    // activity
     {
       $lookup: {
         from: 'projectactivity',
-        localField: 'tasks._id',
-        foreignField: 'ProjectTaskId',
+        let: { taskId: '$tasks._id' },
+        pipeline: [
+          { $match: { $expr: { $eq: ['$ProjectTaskId', '$$taskId'] } } },
+          { $project: { ProjectTaskId: 1, ProjectActivityName: 1 } },
+        ],
         as: 'activities'
       }
     },
     { $unwind: { path: '$activities', preserveNullAndEmptyArrays: true } },
 
-    // Activity → SubActivity (optional)
+    // subactivity
     {
       $lookup: {
         from: 'projectsubactivity',
-        localField: 'activities._id',
-        foreignField: 'ProjectActivityId',
+        let: { actId: '$activities._id' },
+        pipeline: [
+          { $match: { $expr: { $eq: ['$ProjectActivityId', '$$actId'] } } },
+          { $project: { ProjectActivityId: 1, ProjectSubActivityName: 1 } },
+        ],
         as: 'subactivities'
       }
     },
     { $unwind: { path: '$subactivities', preserveNullAndEmptyArrays: true } },
 
-    // Final flattened row
+    // final row
     {
       $project: {
         _id: 0,
@@ -149,37 +197,39 @@ async function getStagegateHierarchyRows(pmwbUserId, opts = {}) {
     }
   ];
 
-  return users.aggregate(pipeline, { allowDiskUse: true }).toArray();
+  return users.aggregate(pipeline, aggOpts(opts, 'getStagegateHierarchyRows')).toArray();
 }
 
-/**
- * Checklist IDs for owners (process/task/activity/subactivity)
- */
-async function getChecklistIdsParallel({ processIds, taskIds, activityIds, subactivityIds }) {
-  const db = mongoose.connection.db;
+
+async function getChecklistIdsParallel({ processIds, taskIds, activityIds, subactivityIds }, opts = {}) {
+  const db = getDb(opts);
 
   const cfgs = [
-    { collection: 'projectprocesschecklist',     field: 'ProcessId',     ids: processIds,     key: 'byProcess' },
-    { collection: 'projecttaskchecklist',        field: 'TaskId',        ids: taskIds,        key: 'byTask' },
-    { collection: 'projectactivitychecklist',    field: 'ActivityId',    ids: activityIds,    key: 'byActivity' },
-    { collection: 'projectsubactivitychecklist', field: 'SubActivityId', ids: subactivityIds, key: 'bySubactivity' },
+    { collection: 'projectprocesschecklist',     field: 'ProcessId',     ids: processIds,     key: 'byProcess',     hint: HINTS.projectprocesschecklist },
+    { collection: 'projecttaskchecklist',        field: 'TaskId',        ids: taskIds,        key: 'byTask',        hint: HINTS.projecttaskchecklist },
+    { collection: 'projectactivitychecklist',    field: 'ActivityId',    ids: activityIds,    key: 'byActivity',    hint: HINTS.projectactivitychecklist },
+    { collection: 'projectsubactivitychecklist', field: 'SubActivityId', ids: subactivityIds, key: 'bySubactivity', hint: HINTS.projectsubactivitychecklist },
   ];
 
-  const result = { byProcess: {}, byTask: {}, byActivity: {}, bySubactivity: {}, all: new Set() };
+  const result = { byProcess: Object.create(null), byTask: Object.create(null), byActivity: Object.create(null), bySubactivity: Object.create(null), all: new Set() };
 
-  await Promise.all(cfgs.map(async ({ collection, field, ids, key }) => {
+  await Promise.all(cfgs.map(async ({ collection, field, ids, key, hint }) => {
     const list = toObjectIds(ids);
     if (!list.length) return;
 
-    const rows = await db.collection(collection)
-      .find({ [field]: { $in: list } }, { projection: { _id: 1, [field]: 1 } })
-      .toArray();
+    let cursor = db.collection(collection)
+      .find({ [field]: { $in: list } }, { projection: { _id: 1, [field]: 1 }, ...findOpts(opts) });
 
+    if (hint) cursor = cursor.hint(hint);
+
+    const rows = await cursor.toArray();
+
+    const bucket = result[key];
     for (const row of rows) {
       const owner = String(row[field]);
       const cid = String(row._id);
-      if (!result[key][owner]) result[key][owner] = [];
-      result[key][owner].push(cid);
+      if (!bucket[owner]) bucket[owner] = [];
+      bucket[owner].push(cid);
       result.all.add(cid);
     }
   }));
@@ -187,60 +237,53 @@ async function getChecklistIdsParallel({ processIds, taskIds, activityIds, subac
   return result;
 }
 
-/**
- * Files across all *files collections for given checklist IDs.
- * Uses FileId (from files docs) as the surfaced fileId so the controller's keys match filecontent._id.
- */
-async function getFilesByChecklistIds(checklistIds = []) {
+
+async function getFilesByChecklistIds(checklistIds = [], opts = {}) {
   if (!Array.isArray(checklistIds) || checklistIds.length === 0) return [];
 
-  const db = mongoose.connection.db;
+  const db = getDb(opts);
   const fileCollections = [
-    'projectprocessfiles',
-    'projecttaskfiles',
-    'projectactivityfiles',
-    'projectsubactivityfiles'
+    { name: 'projectprocessfiles',     hint: HINTS.projectprocessfiles },
+    { name: 'projecttaskfiles',        hint: HINTS.projecttaskfiles },
+    { name: 'projectactivityfiles',    hint: HINTS.projectactivityfiles },
+    { name: 'projectsubactivityfiles', hint: HINTS.projectsubactivityfiles }
   ];
-  const allowed = ['.docx', '.pdf', '.xlsx'];
 
   const queryIds = toObjectIds(checklistIds);
 
   const batches = await Promise.all(
-    fileCollections.map(col =>
-      db.collection(col).find(
+    fileCollections.map(async ({ name, hint }) => {
+      let cursor = db.collection(name).find(
         { ChecklistId: { $in: queryIds } },
-        // include FileId so we can surface it as the key
-        { projection: { _id: 1, ChecklistId: 1, FileId: 1, FileName: 1, name: 1 } }
-      ).toArray()
-    )
+        { projection: { _id: 1, ChecklistId: 1, FileId: 1, FileName: 1, name: 1 }, ...findOpts(opts) }
+      );
+      if (hint) cursor = cursor.hint(hint);
+      return cursor.toArray();
+    })
   );
 
-  const rows = [];
+  const out = [];
   for (const list of batches) {
     for (const r of list) {
       const fileName = r.FileName || r.name;
-      if (!fileName) continue;
-      const lower = String(fileName).toLowerCase();
-      if (!allowed.some(ext => lower.endsWith(ext))) continue;
+      if (!fileName || !hasAllowedExt(fileName)) continue;
 
-      rows.push({
-        fileId: String(r.FileId ?? r.fileId ?? r._id), // prefer FileId; fallback to row _id
-        docId: String(r._id),                           // optional (collection row id)
+      out.push({
+        fileId: String(r.FileId ?? r.fileId ?? r._id), 
+        docId: String(r._id),
         checklistId: String(r.ChecklistId),
         fileName
       });
     }
   }
-  return rows;
+  return out;
 }
 
-/**
- * Threads helper (unchanged).
- */
-async function getThreadsByChecklistIds(checklistIdStrs = []) {
+
+async function getThreadsByChecklistIds(checklistIdStrs = [], opts = {}) {
   if (!Array.isArray(checklistIdStrs) || checklistIdStrs.length === 0) return [];
 
-  const db = mongoose.connection.db;
+  const db = getDb(opts);
   const threads = db.collection('projectThreads');
 
   const pipeline = [
@@ -261,13 +304,11 @@ async function getThreadsByChecklistIds(checklistIdStrs = []) {
     }
   ];
 
-  return threads.aggregate(pipeline, { allowDiskUse: true }).toArray();
+  return threads.aggregate(pipeline, aggOpts(opts, 'getThreadsByChecklistIds')).toArray();
 }
 
-/**
- * filecontent by IDs (kept for future; not used now).
- */
-async function getFileContentMetaByIds(fileIds = []) {
+
+async function getFileContentMetaByIds(fileIds = [], opts = {}) {
   if (!Array.isArray(fileIds) || fileIds.length === 0) return {};
 
   const objIds = [];
@@ -277,13 +318,16 @@ async function getFileContentMetaByIds(fileIds = []) {
   }
   if (!objIds.length) return {};
 
-  const db = mongoose.connection.db;
+  const db = getDb(opts);
   const coll = db.collection('filecontent');
 
-  const docs = await coll.find(
+  let cursor = coll.find(
     { _id: { $in: objIds } },
-    { projection: { FileContent: 1, filecontent: 1, CreatedDate: 1 } }
-  ).toArray();
+    { projection: { FileContent: 1, filecontent: 1, CreatedDate: 1 }, ...findOpts(opts) }
+  );
+  if (HINTS.filecontent_byId) cursor = cursor.hint(HINTS.filecontent_byId);
+
+  const docs = await cursor.toArray();
 
   const out = {};
   for (const d of docs) {
@@ -308,22 +352,23 @@ async function getFileContentMetaByIds(fileIds = []) {
   return out;
 }
 
-/**
- * filecontent by FileName (fallback) — kept for future.
- */
-async function getFileContentMetaByFileNames(fileNames = []) {
+
+async function getFileContentMetaByFileNames(fileNames = [], opts = {}) {
   if (!Array.isArray(fileNames) || fileNames.length === 0) return {};
 
   const names = [...new Set(fileNames.filter(Boolean).map(String))];
   if (!names.length) return {};
 
-  const db = mongoose.connection.db;
+  const db = getDb(opts);
   const coll = db.collection('filecontent');
 
-  const docs = await coll.find(
+  let cursor = coll.find(
     { FileName: { $in: names } },
-    { projection: { FileName: 1, FileContent: 1, filecontent: 1, CreatedDate: 1 } }
-  ).toArray();
+    { projection: { FileName: 1, FileContent: 1, filecontent: 1, CreatedDate: 1 }, ...findOpts(opts) }
+  );
+  if (HINTS.filecontent_byName) cursor = cursor.hint(HINTS.filecontent_byName);
+
+  const docs = await cursor.toArray();
 
   const out = {};
   for (const d of docs) {
@@ -348,27 +393,16 @@ async function getFileContentMetaByFileNames(fileNames = []) {
   return out;
 }
 
-/* ---------------- user-raci: only show user-assigned items ---------------- */
 
-/**
- * Returns Sets of owner IDs (process/task/activity/subactivity) that the given PMWEB user
- * is explicitly assigned to via raciassigness.assigneeId.
- *
- * raciassigness: { assigneeId, raciGroup, raciId }  (field names may vary; we coalesce)
- * Then joins to the appropriate project* r a c i collection to map RaciId → ownerId.
- */
-async function getUserAssignedOwnerIds(pmwbUserId) {
-  const db = mongoose.connection.db;
+async function getUserAssignedOwnerIds(pmwbUserId, opts = {}) {
+  const db = getDb(opts);
   const assignee = toInt(pmwbUserId);
 
-  // NOTE: use your exact collection name as in your DB (spelling per screenshots)
   const assignColl = db.collection('raciassigness');
 
   const assignments = await assignColl.find(
-    {
-      $or: [{ assigneeId: assignee }, { AssigneeId: assignee }],
-    },
-    { projection: { raciId: 1, RaciId: 1, raciGroup: 1, RaciGroup: 1 } }
+    { $or: [{ assigneeId: assignee }, { AssigneeId: assignee }] },
+    { projection: { raciId: 1, RaciId: 1, raciGroup: 1, RaciGroup: 1 }, ...findOpts(opts) }
   ).toArray();
 
   const idsByGroup = { process: [], task: [], activity: [], subactivity: [] };
@@ -392,25 +426,25 @@ async function getUserAssignedOwnerIds(pmwbUserId) {
 
   if (idsByGroup.process.length) {
     const rows = await db.collection('projectprocessraci')
-      .find({ _id: { $in: toObjectIds(idsByGroup.process) } }, { projection: { ProcessId: 1 } })
+      .find({ _id: { $in: toObjectIds(idsByGroup.process) } }, { projection: { ProcessId: 1 }, ...findOpts(opts) })
       .toArray();
     rows.forEach(r => r?.ProcessId && result.process.add(String(r.ProcessId)));
   }
   if (idsByGroup.task.length) {
     const rows = await db.collection('projecttaskraci')
-      .find({ _id: { $in: toObjectIds(idsByGroup.task) } }, { projection: { TaskId: 1 } })
+      .find({ _id: { $in: toObjectIds(idsByGroup.task) } }, { projection: { TaskId: 1 }, ...findOpts(opts) })
       .toArray();
     rows.forEach(r => r?.TaskId && result.task.add(String(r.TaskId)));
   }
   if (idsByGroup.activity.length) {
     const rows = await db.collection('projectactivityraci')
-      .find({ _id: { $in: toObjectIds(idsByGroup.activity) } }, { projection: { ActivityId: 1 } })
+      .find({ _id: { $in: toObjectIds(idsByGroup.activity) } }, { projection: { ActivityId: 1 }, ...findOpts(opts) })
       .toArray();
     rows.forEach(r => r?.ActivityId && result.activity.add(String(r.ActivityId)));
   }
   if (idsByGroup.subactivity.length) {
     const rows = await db.collection('projectsubactivityraci')
-      .find({ _id: { $in: toObjectIds(idsByGroup.subactivity) } }, { projection: { SubActivityId: 1 } })
+      .find({ _id: { $in: toObjectIds(idsByGroup.subactivity) } }, { projection: { SubActivityId: 1 }, ...findOpts(opts) })
       .toArray();
     rows.forEach(r => r?.SubActivityId && result.subactivity.add(String(r.SubActivityId)));
   }
@@ -418,7 +452,6 @@ async function getUserAssignedOwnerIds(pmwbUserId) {
   return result;
 }
 
-/* --------------------------------- exports -------------------------------- */
 
 module.exports = {
   getStagegateHierarchyRows,
@@ -427,5 +460,5 @@ module.exports = {
   getThreadsByChecklistIds,
   getFileContentMetaByIds,
   getFileContentMetaByFileNames,
-  getUserAssignedOwnerIds, // ← new export
+  getUserAssignedOwnerIds,
 };
