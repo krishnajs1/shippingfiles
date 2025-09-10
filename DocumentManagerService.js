@@ -1,39 +1,12 @@
-
 const mongoose = require('mongoose');
 const { ObjectId } = require('mongodb');
 
+/* ----------------------------- helpers ----------------------------------- */
 
-const DEFAULTS = {
-  maxTimeMS: parseInt(process.env.MONGO_OP_MAX_MS || '25000', 10),
-};
-
-const HINTS = {
-  sgprojects: { PMWEB_ProjectId: 1 },
-  projectphaseassetdetails: { PMWEB_ProjectId: 1 },
-  projectstagegates: { ProjectId: 1, ProjectStagegateIsActive: 1 },
-  projectprocess: { ProjectStagegateId: 1 },
-  projecttask: { ProjectProcessId: 1 },
-  projectactivity: { ProjectTaskId: 1 },
-  projectsubactivity: { ProjectActivityId: 1 },
-
-  projectprocesschecklist: { ProcessId: 1 },
-  projecttaskchecklist: { TaskId: 1 },
-  projectactivitychecklist: { ActivityId: 1 },
-  projectsubactivitychecklist: { SubActivityId: 1 },
-
-  projectprocessfiles: { ChecklistId: 1 },
-  projecttaskfiles: { ChecklistId: 1 },
-  projectactivityfiles: { ChecklistId: 1 },
-  projectsubactivityfiles: { ChecklistId: 1 },
-
-  filecontent_byId: { _id: 1 },
-  filecontent_byName: { FileName: 1 },
-};
-
-const ALLOWED_FILE_EXTS = new Set(['.docx', '.pdf', '.xlsx']);
-
-
-function toInt(v) { return typeof v === 'string' ? parseInt(v, 10) : v; }
+function toInt(v) {
+  if (typeof v === 'string') return parseInt(v, 10);
+  return v;
+}
 function buildUserMatch(pmwbUserId, pmwebProjectId) {
   const match = { PMWBUserId: toInt(pmwbUserId) };
   if (pmwebProjectId != null) match.PMWEBProjectId = toInt(pmwebProjectId);
@@ -44,125 +17,104 @@ function toObjectIds(ids) {
     .filter(Boolean)
     .map(id => (mongoose.Types.ObjectId.isValid(id) ? new mongoose.Types.ObjectId(id) : id));
 }
-function getDb(opts) { return (opts && opts.db) ? opts.db : mongoose.connection.db; }
-function aggOpts(opts, comment) {
-  return { allowDiskUse: true, maxTimeMS: (opts && opts.maxTimeMS) || DEFAULTS.maxTimeMS, comment };
-}
-function findOpts(opts) { return { maxTimeMS: (opts && opts.maxTimeMS) || DEFAULTS.maxTimeMS }; }
-function hasAllowedExt(name) {
-  const s = String(name || '').toLowerCase();
-  for (const ext of ALLOWED_FILE_EXTS) if (s.endsWith(ext)) return true;
-  return false;
-}
 
+/* ------------------------------ core queries ----------------------------- */
 
+/**
+ * Flattened rows for a user's visibility:
+ * projectusers → sgprojects → projectstagegates (active) → process → task → activity → subactivity
+ * + projectphaseassetdetails (Community/Phase)
+ *
+ * NOTE: Stagegates/processes are unwound with preserveNull so phases show up even if empty.
+ */
 async function getStagegateHierarchyRows(pmwbUserId, opts = {}) {
-  const db = getDb(opts);
+  const db = mongoose.connection.db;
   const users = db.collection('projectusers');
 
   const pipeline = [
     { $match: buildUserMatch(pmwbUserId, opts.pmwebProjectId) },
 
-    // sgprojects (sub-pipeline + projection)
+    // Link projects (sgprojects)
     {
       $lookup: {
         from: 'sgprojects',
-        let: { projId: '$PMWEBProjectId' },
-        pipeline: [
-          { $match: { $expr: { $eq: ['$PMWEB_ProjectId', '$$projId'] } } },
-          { $project: { PMWEB_ProjectId: 1, PMWEB_ProjectName: 1, ProjectCommunity: 1, ProjectPhaseOrProject: 1 } },
-        ],
-        as: 'project',
+        localField: 'PMWEBProjectId',
+        foreignField: 'PMWEB_ProjectId',
+        as: 'project'
       }
     },
-    { $unwind: '$project' },
+    { $unwind: '$project' }, // keep strict here: we scope using sgprojects
 
-    // projectphaseassetdetails
+    // Community / Phase labels
     {
       $lookup: {
         from: 'projectphaseassetdetails',
-        let: { projId: '$PMWEBProjectId' },
-        pipeline: [
-          { $match: { $expr: { $eq: ['$PMWEB_ProjectId', '$$projId'] } } },
-          { $project: { PMWEB_ProjectId: 1, Community: 1, Project: 1 } },
-        ],
+        localField: 'PMWEBProjectId',
+        foreignField: 'PMWEB_ProjectId',
         as: 'phaseDetails'
       }
     },
     { $unwind: { path: '$phaseDetails', preserveNullAndEmptyArrays: true } },
 
-    // projectstagegates (active)
+    // Active stagegates for this sgproject (preserve even if none)
     {
       $lookup: {
         from: 'projectstagegates',
-        let: { projObjId: '$project._id' },
+        let: { projId: '$project._id' },
         pipeline: [
-          { $match: { $expr: { $eq: ['$ProjectId', '$$projObjId'] } } },
-          { $match: { ProjectStagegateIsActive: true } },
-          { $project: { ProjectId: 1, ProjectStagegateName: 1 } },
+          { $match: { $expr: { $eq: ['$ProjectId', '$$projId'] } } },
+          { $match: { ProjectStagegateIsActive: true } }
         ],
         as: 'stagegates'
       }
     },
     { $unwind: { path: '$stagegates', preserveNullAndEmptyArrays: true } },
 
-    // process
+    // SG → Process (preserve even if none)
     {
       $lookup: {
         from: 'projectprocess',
-        let: { sgId: '$stagegates._id' },
-        pipeline: [
-          { $match: { $expr: { $eq: ['$ProjectStagegateId', '$$sgId'] } } },
-          { $project: { ProjectStagegateId: 1, ProjectProcessName: 1 } },
-        ],
+        localField: 'stagegates._id',
+        foreignField: 'ProjectStagegateId',
         as: 'processes'
       }
     },
     { $unwind: { path: '$processes', preserveNullAndEmptyArrays: true } },
 
-    // task
+    // Process → Task (optional)
     {
       $lookup: {
         from: 'projecttask',
-        let: { procId: '$processes._id' },
-        pipeline: [
-          { $match: { $expr: { $eq: ['$ProjectProcessId', '$$procId'] } } },
-          { $project: { ProjectProcessId: 1, ProjectTaskName: 1 } },
-        ],
+        localField: 'processes._id',
+        foreignField: 'ProjectProcessId',
         as: 'tasks'
       }
     },
     { $unwind: { path: '$tasks', preserveNullAndEmptyArrays: true } },
 
-    // activity
+    // Task → Activity (optional)
     {
       $lookup: {
         from: 'projectactivity',
-        let: { taskId: '$tasks._id' },
-        pipeline: [
-          { $match: { $expr: { $eq: ['$ProjectTaskId', '$$taskId'] } } },
-          { $project: { ProjectTaskId: 1, ProjectActivityName: 1 } },
-        ],
+        localField: 'tasks._id',
+        foreignField: 'ProjectTaskId',
         as: 'activities'
       }
     },
     { $unwind: { path: '$activities', preserveNullAndEmptyArrays: true } },
 
-    // subactivity
+    // Activity → SubActivity (optional)
     {
       $lookup: {
         from: 'projectsubactivity',
-        let: { actId: '$activities._id' },
-        pipeline: [
-          { $match: { $expr: { $eq: ['$ProjectActivityId', '$$actId'] } } },
-          { $project: { ProjectActivityId: 1, ProjectSubActivityName: 1 } },
-        ],
+        localField: 'activities._id',
+        foreignField: 'ProjectActivityId',
         as: 'subactivities'
       }
     },
     { $unwind: { path: '$subactivities', preserveNullAndEmptyArrays: true } },
 
-    // final row
+    // Final flattened row
     {
       $project: {
         _id: 0,
@@ -197,39 +149,37 @@ async function getStagegateHierarchyRows(pmwbUserId, opts = {}) {
     }
   ];
 
-  return users.aggregate(pipeline, aggOpts(opts, 'getStagegateHierarchyRows')).toArray();
+  return users.aggregate(pipeline, { allowDiskUse: true }).toArray();
 }
 
-
-async function getChecklistIdsParallel({ processIds, taskIds, activityIds, subactivityIds }, opts = {}) {
-  const db = getDb(opts);
+/**
+ * Checklist IDs for owners (process/task/activity/subactivity)
+ */
+async function getChecklistIdsParallel({ processIds, taskIds, activityIds, subactivityIds }) {
+  const db = mongoose.connection.db;
 
   const cfgs = [
-    { collection: 'projectprocesschecklist',     field: 'ProcessId',     ids: processIds,     key: 'byProcess',     hint: HINTS.projectprocesschecklist },
-    { collection: 'projecttaskchecklist',        field: 'TaskId',        ids: taskIds,        key: 'byTask',        hint: HINTS.projecttaskchecklist },
-    { collection: 'projectactivitychecklist',    field: 'ActivityId',    ids: activityIds,    key: 'byActivity',    hint: HINTS.projectactivitychecklist },
-    { collection: 'projectsubactivitychecklist', field: 'SubActivityId', ids: subactivityIds, key: 'bySubactivity', hint: HINTS.projectsubactivitychecklist },
+    { collection: 'projectprocesschecklist',     field: 'ProcessId',     ids: processIds,     key: 'byProcess' },
+    { collection: 'projecttaskchecklist',        field: 'TaskId',        ids: taskIds,        key: 'byTask' },
+    { collection: 'projectactivitychecklist',    field: 'ActivityId',    ids: activityIds,    key: 'byActivity' },
+    { collection: 'projectsubactivitychecklist', field: 'SubActivityId', ids: subactivityIds, key: 'bySubactivity' },
   ];
 
-  const result = { byProcess: Object.create(null), byTask: Object.create(null), byActivity: Object.create(null), bySubactivity: Object.create(null), all: new Set() };
+  const result = { byProcess: {}, byTask: {}, byActivity: {}, bySubactivity: {}, all: new Set() };
 
-  await Promise.all(cfgs.map(async ({ collection, field, ids, key, hint }) => {
+  await Promise.all(cfgs.map(async ({ collection, field, ids, key }) => {
     const list = toObjectIds(ids);
     if (!list.length) return;
 
-    let cursor = db.collection(collection)
-      .find({ [field]: { $in: list } }, { projection: { _id: 1, [field]: 1 }, ...findOpts(opts) });
+    const rows = await db.collection(collection)
+      .find({ [field]: { $in: list } }, { projection: { _id: 1, [field]: 1 } })
+      .toArray();
 
-    if (hint) cursor = cursor.hint(hint);
-
-    const rows = await cursor.toArray();
-
-    const bucket = result[key];
     for (const row of rows) {
       const owner = String(row[field]);
       const cid = String(row._id);
-      if (!bucket[owner]) bucket[owner] = [];
-      bucket[owner].push(cid);
+      if (!result[key][owner]) result[key][owner] = [];
+      result[key][owner].push(cid);
       result.all.add(cid);
     }
   }));
@@ -237,53 +187,60 @@ async function getChecklistIdsParallel({ processIds, taskIds, activityIds, subac
   return result;
 }
 
-
-async function getFilesByChecklistIds(checklistIds = [], opts = {}) {
+/**
+ * Files across all *files collections for given checklist IDs.
+ * Uses FileId (from files docs) as the surfaced fileId so the controller's keys match filecontent._id.
+ */
+async function getFilesByChecklistIds(checklistIds = []) {
   if (!Array.isArray(checklistIds) || checklistIds.length === 0) return [];
 
-  const db = getDb(opts);
+  const db = mongoose.connection.db;
   const fileCollections = [
-    { name: 'projectprocessfiles',     hint: HINTS.projectprocessfiles },
-    { name: 'projecttaskfiles',        hint: HINTS.projecttaskfiles },
-    { name: 'projectactivityfiles',    hint: HINTS.projectactivityfiles },
-    { name: 'projectsubactivityfiles', hint: HINTS.projectsubactivityfiles }
+    'projectprocessfiles',
+    'projecttaskfiles',
+    'projectactivityfiles',
+    'projectsubactivityfiles'
   ];
+  const allowed = ['.docx', '.pdf', '.xlsx'];
 
   const queryIds = toObjectIds(checklistIds);
 
   const batches = await Promise.all(
-    fileCollections.map(async ({ name, hint }) => {
-      let cursor = db.collection(name).find(
+    fileCollections.map(col =>
+      db.collection(col).find(
         { ChecklistId: { $in: queryIds } },
-        { projection: { _id: 1, ChecklistId: 1, FileId: 1, FileName: 1, name: 1 }, ...findOpts(opts) }
-      );
-      if (hint) cursor = cursor.hint(hint);
-      return cursor.toArray();
-    })
+        // include FileId so we can surface it as the key
+        { projection: { _id: 1, ChecklistId: 1, FileId: 1, FileName: 1, name: 1 } }
+      ).toArray()
+    )
   );
 
-  const out = [];
+  const rows = [];
   for (const list of batches) {
     for (const r of list) {
       const fileName = r.FileName || r.name;
-      if (!fileName || !hasAllowedExt(fileName)) continue;
+      if (!fileName) continue;
+      const lower = String(fileName).toLowerCase();
+      if (!allowed.some(ext => lower.endsWith(ext))) continue;
 
-      out.push({
-        fileId: String(r.FileId ?? r.fileId ?? r._id), 
-        docId: String(r._id),
+      rows.push({
+        fileId: String(r.FileId ?? r.fileId ?? r._id), // prefer FileId; fallback to row _id
+        docId: String(r._id),                           // optional (collection row id)
         checklistId: String(r.ChecklistId),
         fileName
       });
     }
   }
-  return out;
+  return rows;
 }
 
-
-async function getThreadsByChecklistIds(checklistIdStrs = [], opts = {}) {
+/**
+ * Threads helper (unchanged).
+ */
+async function getThreadsByChecklistIds(checklistIdStrs = []) {
   if (!Array.isArray(checklistIdStrs) || checklistIdStrs.length === 0) return [];
 
-  const db = getDb(opts);
+  const db = mongoose.connection.db;
   const threads = db.collection('projectThreads');
 
   const pipeline = [
@@ -304,11 +261,13 @@ async function getThreadsByChecklistIds(checklistIdStrs = [], opts = {}) {
     }
   ];
 
-  return threads.aggregate(pipeline, aggOpts(opts, 'getThreadsByChecklistIds')).toArray();
+  return threads.aggregate(pipeline, { allowDiskUse: true }).toArray();
 }
 
-
-async function getFileContentMetaByIds(fileIds = [], opts = {}) {
+/**
+ * filecontent by IDs (kept for future; not used now).
+ */
+async function getFileContentMetaByIds(fileIds = []) {
   if (!Array.isArray(fileIds) || fileIds.length === 0) return {};
 
   const objIds = [];
@@ -318,16 +277,13 @@ async function getFileContentMetaByIds(fileIds = [], opts = {}) {
   }
   if (!objIds.length) return {};
 
-  const db = getDb(opts);
+  const db = mongoose.connection.db;
   const coll = db.collection('filecontent');
 
-  let cursor = coll.find(
+  const docs = await coll.find(
     { _id: { $in: objIds } },
-    { projection: { FileContent: 1, filecontent: 1, CreatedDate: 1 }, ...findOpts(opts) }
-  );
-  if (HINTS.filecontent_byId) cursor = cursor.hint(HINTS.filecontent_byId);
-
-  const docs = await cursor.toArray();
+    { projection: { FileContent: 1, filecontent: 1, CreatedDate: 1 } }
+  ).toArray();
 
   const out = {};
   for (const d of docs) {
@@ -352,23 +308,22 @@ async function getFileContentMetaByIds(fileIds = [], opts = {}) {
   return out;
 }
 
-
-async function getFileContentMetaByFileNames(fileNames = [], opts = {}) {
+/**
+ * filecontent by FileName (fallback) — kept for future.
+ */
+async function getFileContentMetaByFileNames(fileNames = []) {
   if (!Array.isArray(fileNames) || fileNames.length === 0) return {};
 
   const names = [...new Set(fileNames.filter(Boolean).map(String))];
   if (!names.length) return {};
 
-  const db = getDb(opts);
+  const db = mongoose.connection.db;
   const coll = db.collection('filecontent');
 
-  let cursor = coll.find(
+  const docs = await coll.find(
     { FileName: { $in: names } },
-    { projection: { FileName: 1, FileContent: 1, filecontent: 1, CreatedDate: 1 }, ...findOpts(opts) }
-  );
-  if (HINTS.filecontent_byName) cursor = cursor.hint(HINTS.filecontent_byName);
-
-  const docs = await cursor.toArray();
+    { projection: { FileName: 1, FileContent: 1, filecontent: 1, CreatedDate: 1 } }
+  ).toArray();
 
   const out = {};
   for (const d of docs) {
@@ -393,16 +348,28 @@ async function getFileContentMetaByFileNames(fileNames = [], opts = {}) {
   return out;
 }
 
+/* ---------------- user-raci: only show user-assigned items ---------------- */
 
-async function getUserAssignedOwnerIds(pmwbUserId, opts = {}) {
-  const db = getDb(opts);
+/**
+ * Returns Sets of owner IDs (process/task/activity/subactivity) that the given PMWEB user
+ * is explicitly assigned to via raciassigness.assigneeId.
+ *
+ * raciassigness: { assigneeId, raciGroup, raciId }  (field names may vary; we coalesce)
+ * Then joins to the appropriate project* r a c i collection to map RaciId → ownerId.
+ */
+
+async function getUserAssignedOwnerIds(pmwbUserId) {
+  const db = mongoose.connection.db;
   const assignee = toInt(pmwbUserId);
 
+  // NOTE: use your exact collection name as in your DB (spelling per screenshots)
   const assignColl = db.collection('raciassigness');
 
   const assignments = await assignColl.find(
-    { $or: [{ assigneeId: assignee }, { AssigneeId: assignee }] },
-    { projection: { raciId: 1, RaciId: 1, raciGroup: 1, RaciGroup: 1 }, ...findOpts(opts) }
+    {
+      $or: [{ assigneeId: assignee }, { AssigneeId: assignee }],
+    },
+    { projection: { raciId: 1, RaciId: 1, raciGroup: 1, RaciGroup: 1 } }
   ).toArray();
 
   const idsByGroup = { process: [], task: [], activity: [], subactivity: [] };
@@ -426,32 +393,160 @@ async function getUserAssignedOwnerIds(pmwbUserId, opts = {}) {
 
   if (idsByGroup.process.length) {
     const rows = await db.collection('projectprocessraci')
-      .find({ _id: { $in: toObjectIds(idsByGroup.process) } }, { projection: { ProcessId: 1 }, ...findOpts(opts) })
+      .find({ _id: { $in: toObjectIds(idsByGroup.process) } }, { projection: { ProcessId: 1 } })
       .toArray();
     rows.forEach(r => r?.ProcessId && result.process.add(String(r.ProcessId)));
   }
   if (idsByGroup.task.length) {
     const rows = await db.collection('projecttaskraci')
-      .find({ _id: { $in: toObjectIds(idsByGroup.task) } }, { projection: { TaskId: 1 }, ...findOpts(opts) })
+      .find({ _id: { $in: toObjectIds(idsByGroup.task) } }, { projection: { TaskId: 1 } })
       .toArray();
     rows.forEach(r => r?.TaskId && result.task.add(String(r.TaskId)));
   }
   if (idsByGroup.activity.length) {
     const rows = await db.collection('projectactivityraci')
-      .find({ _id: { $in: toObjectIds(idsByGroup.activity) } }, { projection: { ActivityId: 1 }, ...findOpts(opts) })
+      .find({ _id: { $in: toObjectIds(idsByGroup.activity) } }, { projection: { ActivityId: 1 } })
       .toArray();
     rows.forEach(r => r?.ActivityId && result.activity.add(String(r.ActivityId)));
   }
   if (idsByGroup.subactivity.length) {
     const rows = await db.collection('projectsubactivityraci')
-      .find({ _id: { $in: toObjectIds(idsByGroup.subactivity) } }, { projection: { SubActivityId: 1 }, ...findOpts(opts) })
+      .find({ _id: { $in: toObjectIds(idsByGroup.subactivity) } }, { projection: { SubActivityId: 1 } })
       .toArray();
     rows.forEach(r => r?.SubActivityId && result.subactivity.add(String(r.SubActivityId)));
   }
 
   return result;
 }
+//insering comments
+async function insertFileComment({ fileId, userId, createdBy, text, page, anchorText, rect  ,yPct ,xPct }) {
+  
+  const db = mongoose.connection.db;
+  const coll = db.collection('projectFileComments');
+  const users = db.collection('users');
 
+  const toObjId = s => (ObjectId.isValid(String(s)) ? new ObjectId(String(s)) : null);
+  const isDigits = s => typeof s === 'string' && /^[0-9]+$/.test(s.trim());
+
+  const fileIdObj = toObjId(fileId);
+  if (!fileIdObj) throw new Error('Validation: fileId must be a valid ObjectId hex string');
+
+  async function resolveUser(ref) {
+    if (ref == null) return null;
+
+    const oid = toObjId(ref);
+    if (oid) {
+      const u = await users.findOne({ _id: oid }, { projection: { _id: 1, pmwebUserID: 1 } });
+      return u ? { _id: u._id, pmwebUserID: u.pmwebUserID } : null;
+    }
+
+    const str = String(ref).trim();
+    const or = [];
+    if (isDigits(str)) {
+      const n = parseInt(str, 10);
+      or.push({ pmwebUserID: n });
+    }
+    if (str.includes('@')) or.push({ pmwebUserEmail: str });
+    or.push({ userName: str });
+
+    const u = await users.findOne({ $or: or }, { projection: { _id: 1, pmwebUserID: 1 } });
+    return u ? { _id: u._id, pmwebUserID: u.pmwebUserID } : null;
+  }
+
+  const author  = await resolveUser(userId);
+  const creator = (await resolveUser(createdBy)) || author;
+
+  if (!author)  throw new Error(`Validation: unable to resolve userId "${userId}" to 'projectusers'.`);
+  if (!creator) throw new Error(`Validation: unable to resolve createdBy "${createdBy}".`);
+
+  const now = new Date();
+  const doc = {
+    fileId: fileIdObj
+
+  ,yPct:yPct ,xPct:xPct ,
+    userId: author._id,
+    createdBy: creator._id,
+    text: String(text),
+  
+    ...(Number.isFinite(author.pmwebUserID) ? { pmwebUserID: author.pmwebUserID } : {}),
+    page: Number.isFinite(page) ? page : undefined,
+    anchorText: anchorText || undefined,
+    rect: rect || undefined,
+    createdAt: now,
+    updatedAt: now,
+  };
+
+
+
+  const res = await coll.insertOne(doc);
+  return { _id: res.insertedId, ...doc };
+
+}
+
+async function getFileCommentsByFileId(fileId) {
+  if (!fileId) return [];
+  const db = mongoose.connection.db;
+  const coll = db.collection('projectFileComments');
+
+  const s = String(fileId);
+  const ors = [];
+  if (ObjectId.isValid(s)) ors.push({ fileId: new ObjectId(s) }); 
+  ors.push({ fileIdStr: s });                                     
+
+  const pipeline = [
+    { $match: { $or: ors } },
+    { $sort: { createdAt: 1, _id: 1 } },
+
+   
+    {
+      $lookup: {
+        from: 'users',
+        localField: 'userId',
+        foreignField: '_id',
+        as: 'user'
+      }
+    },
+    { $unwind: { path: '$user', preserveNullAndEmptyArrays: true } },
+
+    {
+      $addFields: {
+        pmwebUserID: { $ifNull: ['$pmwebUserID', '$user.pmwebUserID'] },
+        userDisplayName: {
+          $ifNull: [
+            '$user.userName',
+            {
+              $trim: {
+                input: {
+                  $concat: [
+                    { $ifNull: ['$user.firstName', ''] },
+                    ' ',
+                    { $ifNull: ['$user.lastName', ''] }
+                  ]
+                }
+              }
+            }
+          ]
+        },
+        userEmail: '$user.pmwebUserEmail'
+      }
+    },
+
+    {
+      $project: {
+        text: 1, page: 1, anchorText: 1, rect: 1
+        ,yPct:1 ,xPct :1,
+        fileId: 1, fileIdStr: 1,
+        userId: 1, createdBy: 1,
+        pmwebUserID: 1,
+        createdAt: 1, updatedAt: 1,
+        userDisplayName: 1, userEmail: 1
+      }
+    }
+  ];
+
+  return coll.aggregate(pipeline, { allowDiskUse: true }).toArray();
+}
+/* --------------------------------- exports -------------------------------- */
 
 module.exports = {
   getStagegateHierarchyRows,
@@ -460,5 +555,7 @@ module.exports = {
   getThreadsByChecklistIds,
   getFileContentMetaByIds,
   getFileContentMetaByFileNames,
-  getUserAssignedOwnerIds,
+  getUserAssignedOwnerIds, 
+  insertFileComment,
+  getFileCommentsByFileId
 };
