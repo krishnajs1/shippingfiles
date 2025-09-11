@@ -1,5 +1,6 @@
 const mongoose = require('mongoose');
 const { ObjectId } = require('mongodb');
+const {getSignedUrl} =require('../utils/signedUrls')
 
 /* ----------------------------- helpers ----------------------------------- */
 
@@ -201,7 +202,7 @@ async function getFilesByChecklistIds(checklistIds = []) {
     'projectactivityfiles',
     'projectsubactivityfiles'
   ];
-  const allowed = ['.docx', '.pdf', '.xlsx'];
+  const allowed = ['.docx', '.pdf', '.xlsx' ,'ppt' ,'pptx'];
 
   const queryIds = toObjectIds(checklistIds);
 
@@ -308,6 +309,18 @@ async function getFileContentMetaByIdsOld(fileIds = []) {
   return out;
 }
 
+
+
+function normalizeToBase64(content) {
+  if (!content) return null;
+  if (typeof content === 'string') return content;                    // already base64 string
+  if (Buffer.isBuffer(content)) return content.toString('base64');    // raw buffer
+  if (content?.buffer) return Buffer.from(content.buffer).toString('base64'); // BSON Binary
+  return String(content);
+}
+
+
+
 async function fetchAsBase64FromSignedUrl(signedUrl) {
   const resp = await fetch(signedUrl, { method: 'GET' });
   if (!resp.ok) {
@@ -323,49 +336,46 @@ async function fetchAsBase64FromSignedUrl(signedUrl) {
   };
 }
 
-function normalizeToBase64(content) {
-  if (!content) return null;
-  if (typeof content === 'string') return content;                    // already base64 string
-  if (Buffer.isBuffer(content)) return content.toString('base64');    // raw buffer
-  if (content?.buffer) return Buffer.from(content.buffer).toString('base64'); // BSON Binary
-  return String(content);
-}
+/* ----------------------------- core function ----------------------------- */
 
+/**
+ * Hybrid: returns filecontent either from Mongo (old) or GCS (new)
+ */
 async function getFileContentMetaByIds(fileIds = []) {
   if (!Array.isArray(fileIds) || fileIds.length === 0) return {};
 
-  const objIds = [];
-  for (const raw of fileIds) {
-    const s = String(raw);
-    if (ObjectId.isValid(s)) objIds.push(new ObjectId(s));
-  }
+  const objIds = fileIds
+    .map((id) => String(id))
+    .filter((s) => ObjectId.isValid(s))
+    .map((s) => new ObjectId(s));
+
   if (!objIds.length) return {};
 
   const db = mongoose.connection.db;
   const coll = db.collection('filecontent');
 
-  // Pull both old (binary) and new (GCS) fields
-  const docs = await coll.find(
-    { _id: { $in: objIds } },
-    {
-      projection: {
-        FileName: 1,
-        FileType: 1,
-        FileSize: 1,
-        Bucket: 1,
-        GCSPath: 1,
-        CreatedDate: 1,
-        FileContent: 1,
-        filecontent: 1,
-      },
-    }
-  ).toArray();
+  const docs = await coll
+    .find(
+      { _id: { $in: objIds } },
+      {
+        projection: {
+          FileName: 1,
+          FileType: 1,
+          FileSize: 1,
+          Bucket: 1,
+          GCSPath: 1,
+          CreatedDate: 1,
+          FileContent: 1,
+          filecontent: 1,
+        },
+      }
+    )
+    .toArray();
 
-  // Build results concurrently when we need to hit GCS
   const tasks = docs.map(async (d) => {
     const idStr = String(d._id);
 
-    // 1) Old model: binary in Mongo
+    // 1) Old model: Mongo binary
     const inline = d.filecontent ?? d.FileContent;
     const inlineBase64 = normalizeToBase64(inline);
     if (inlineBase64) {
@@ -382,38 +392,41 @@ async function getFileContentMetaByIds(fileIds = []) {
       ];
     }
 
-    // 2) New model: stored in GCS (Bucket + GCSPath)
-    // if (d.Bucket && d.GCSPath) {
-    //   try {
-    //     const signedUrl = await getReadSignedUrl(d.Bucket, d.GCSPath, d.FileType);
-    //     const { base64, contentType, size } = await fetchAsBase64FromSignedUrl(signedUrl);
-    //     return [
-    //       idStr,
-    //       {
-    //         filecontent: base64,
-    //         CreatedDate: d.CreatedDate ?? null,
-    //         FileType: contentType || d.FileType || 'application/octet-stream',
-    //         FileSize: size || d.FileSize || null,
-    //         FileName: d.FileName || null,
-    //         Bucket: d.Bucket,
-    //         GCSPath: d.GCSPath,
-    //         source: 'gcs-signed-url',
-    //       },
-    //     ];
-    //   } catch (e) {
-    //     console.error(`GCS fetch failed for ${idStr} (${d.Bucket}/${d.GCSPath})`, e);
-    //     return [idStr, { error: 'GCS fetch failed', CreatedDate: d.CreatedDate ?? null }];
-    //   }
-    // }
+    // 2) New model: GCS
+    if (d.Bucket && d.GCSPath) {
+      try {
+        const signedUrl = await getSignedUrl(d.GCSPath);
+        const { base64, contentType, size } =
+          await fetchAsBase64FromSignedUrl(signedUrl);
 
-    // 3) Neither present
+        return [
+          idStr,
+          {
+            filecontent: base64,
+            CreatedDate: d.CreatedDate ?? null,
+            FileType: contentType || d.FileType || 'application/octet-stream',
+            FileSize: size || d.FileSize || null,
+            FileName: d.FileName || null,
+            Bucket: d.Bucket,
+            GCSPath: d.GCSPath,
+            source: 'gcs-signed-url',
+          },
+        ];
+      } catch (e) {
+        console.error(
+          `GCS fetch failed for ${idStr} (${d.Bucket}/${d.GCSPath})`,
+          e
+        );
+        return [idStr, { error: 'GCS fetch failed', CreatedDate: d.CreatedDate ?? null }];
+      }
+    }
+
+    // 3) No content
     return [idStr, { error: 'No content found', CreatedDate: d.CreatedDate ?? null }];
   });
 
   const entries = await Promise.all(tasks);
-  const out = {};
-  for (const [k, v] of entries) out[k] = v;
-  return out;
+  return Object.fromEntries(entries);
 }
 
 /**
